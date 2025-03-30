@@ -4,6 +4,7 @@ import joblib
 import pandas as pd
 from typing import List, Dict, Optional, Union
 import logging
+import os
 import uvicorn
 
 # Configure logging
@@ -20,15 +21,25 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Load models
-try:
-    model = joblib.load("soil_health_model.pkl")
-    crop_encoder = joblib.load("crop_encoder.pkl")
-    soil_health_encoder = joblib.load("soil_health_encoder.pkl")
-    logger.info("Models loaded successfully")
-except Exception as e:
-    logger.error(f"Error loading models: {e}")
-    raise
+# Global variables for models
+model = None
+crop_encoder = None
+soil_health_encoder = None
+
+# Lazy loading for models
+def load_models():
+    global model, crop_encoder, soil_health_encoder
+    try:
+        if model is None or crop_encoder is None or soil_health_encoder is None:
+            logger.info("Loading models...")
+            model = joblib.load("soil_health_model.pkl")
+            crop_encoder = joblib.load("crop_encoder.pkl")
+            soil_health_encoder = joblib.load("soil_health_encoder.pkl")
+            logger.info("Models loaded successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Error loading models: {e}")
+        return False
 
 # Define ideal NPK values for different crops
 IDEAL_NPK = {
@@ -73,31 +84,51 @@ def check_deficiency(N, P, K, crop):
 
 # Function to predict soil health
 def predict_soil_health(N, P, K, Moisture, Latitude, Longitude, Crop):
+    # Load models if not loaded
+    if not load_models():
+        return "Model Loading Error", None
+    
     # Check if crop is valid
     if Crop not in crop_encoder.classes_:
         return "Invalid Crop Type", None
     
-    # Encode crop type
-    Crop_encoded = crop_encoder.transform([Crop])[0]
-    
-    # Create input DataFrame
-    input_data = pd.DataFrame([[N, P, K, Moisture, Latitude, Longitude, Crop_encoded]],
-                              columns=["N", "P", "K", "Moisture", "Latitude", "Longitude", "Crop Type"])
-    
-    # Predict soil health
-    prediction = model.predict(input_data)
-    
-    # Decode predicted class
-    soil_health = soil_health_encoder.inverse_transform(prediction)[0]
-    
-    # Check for nutrient deficiencies
-    deficiency = check_deficiency(N, P, K, Crop)
-    return soil_health, deficiency
+    try:
+        # Encode crop type
+        Crop_encoded = crop_encoder.transform([Crop])[0]
+        
+        # Create input DataFrame
+        input_data = pd.DataFrame([[N, P, K, Moisture, Latitude, Longitude, Crop_encoded]],
+                                columns=["N", "P", "K", "Moisture", "Latitude", "Longitude", "Crop Type"])
+        
+        # Predict soil health
+        prediction = model.predict(input_data)
+        
+        # Decode predicted class
+        soil_health = soil_health_encoder.inverse_transform(prediction)[0]
+        
+        # Check for nutrient deficiencies
+        deficiency = check_deficiency(N, P, K, Crop)
+        return soil_health, deficiency
+    except Exception as e:
+        logger.error(f"Error in prediction: {e}")
+        return f"Prediction Error: {str(e)}", None
 
 # API Endpoints
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Soil Health API"}
+
+@app.get("/health")
+def health_check():
+    models_loaded = load_models()
+    return {
+        "status": "healthy" if models_loaded else "unhealthy",
+        "models_loaded": models_loaded,
+        "environment": {
+            "python_path": os.environ.get('PYTHONPATH', 'Not set'),
+            "environment": os.environ.get('VERCEL_ENV', 'Not on Vercel')
+        }
+    }
 
 @app.post("/predict", response_model=SoilHealthResponse)
 def predict(data: SoilDataInput):
@@ -112,6 +143,10 @@ def predict(data: SoilDataInput):
         
         # Predict soil health
         prediction, deficiency = predict_soil_health(N, P, K, Moisture, Latitude, Longitude, Crop)
+        
+        # Check for model errors
+        if prediction.startswith("Model Loading Error") or prediction.startswith("Prediction Error"):
+            raise HTTPException(status_code=500, detail=prediction)
         
         # Create deficiency message
         deficiency_str = ", ".join([f"{nutrient} deficient by {deficit}" for nutrient, deficit in deficiency.items() if deficit > 0])
@@ -142,11 +177,15 @@ def batch_predict(data_list: List[SoilDataInput]):
             # Predict soil health
             prediction, deficiency = predict_soil_health(N, P, K, Moisture, Latitude, Longitude, Crop)
             
+            # Check for model errors
+            if prediction.startswith("Model Loading Error") or prediction.startswith("Prediction Error"):
+                results.append({"error": prediction})
+                continue
+                
             # Create deficiency message
             deficiency_str = ", ".join([f"{nutrient} deficient by {deficit}" for nutrient, deficit in deficiency.items() if deficit > 0])
             deficiency_str = deficiency_str if deficiency_str else "No Deficiency"
             
-            # Log results
             logger.info(f"Prediction for {Crop} at ({Latitude}, {Longitude}): {prediction}, Deficiency: {deficiency_str}")
             
             # Append to results
@@ -167,5 +206,4 @@ def batch_predict(data_list: List[SoilDataInput]):
 
 if __name__ == "__main__":
     # This will only run when you execute the script directly
-    # Vercel will use the app object directly
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
